@@ -38,12 +38,15 @@ except ImportError:
     install_requirements()
     import discord
 
+import discord
 from discord import app_commands
 from discord.ext import commands
 import asyncio
 import sqlite3
 import yt_dlp
+import yt_dlp as youtube_dl
 from collections import Counter
+from config import BOT_TOKEN, YTDL_FORMAT_OPTIONS, FFMPEG_OPTIONS
 from discord import PCMVolumeTransformer
 from concurrent.futures import ThreadPoolExecutor
 from typing import Optional
@@ -52,6 +55,7 @@ import logging
 import hashlib
 from discord import Activity, ActivityType
 from yt_dlp import YoutubeDL
+import traceback
 
 # Check if config.py exists, if not, create it
 if not os.path.exists('config.py'):
@@ -126,24 +130,34 @@ except ImportError:
     print("Discord library not found. Installing requirements...")
     install_requirements()
 
-# Set up logging
-logging.basicConfig(level=logging.DEBUG)
-logger = logging.getLogger('music_bot')
+TEST_GUILD_ID = 
+
+ADMIN_IDS = [818226562045837313, 764413811201146890]
 
 intents = discord.Intents.default()
 intents.message_content = True
 
 # Simple cache to store video information
 video_cache = {}
+CACHE_DURATION = 3600  # 1 hour
+
+# Set up logging
+logging.basicConfig(level=logging.DEBUG)
+logger = logging.getLogger('music_bot')
+
+
 
 class MusicBot(commands.Bot):
     def __init__(self):
-        super().__init__(command_prefix=COMMAND_PREFIX, intents=intents)
+        intents = discord.Intents.default()
+        intents.message_content = True
+        super().__init__(command_prefix='/', intents=intents)
         self.currently_playing = None
         self.queue = asyncio.Queue()
         self.db = sqlite3.connect('music_bot.db')
         self.create_tables()
         self.migrate_database()
+        self.last_voice_channel = None
 
     async def setup_hook(self):
         try:
@@ -216,6 +230,7 @@ class MusicBot(commands.Bot):
 bot = MusicBot()
 
 
+
 def calculate_level(exp):
     return exp // 99999  # Simplified level calculation
 
@@ -276,7 +291,6 @@ class MusicControls(discord.ui.View):
         
         interaction.guild.voice_client.stop()
         await interaction.response.send_message("Skipped the song.", ephemeral=True)
-        await play_next(interaction)
 
     @discord.ui.button(label="Stop", style=discord.ButtonStyle.danger, custom_id="stop")
     async def stop(self, interaction: discord.Interaction, button: discord.ui.Button):
@@ -381,36 +395,59 @@ async def play(interaction: discord.Interaction, url: str):
         print(f"An error occurred while processing the song/playlist: {e}")
         await interaction.followup.send(f"An error occurred while processing the song/playlist. Please try again or use a different link.")
 
-async def play_next(interaction):
+def is_bot_connected(guild):
+    return guild.voice_client is not None and guild.voice_client.is_connected()
+
+async def clear_queue_if_disconnected(guild):
+    if not is_bot_connected(guild):
+        bot.queue = asyncio.Queue()  # Clear the queue
+        bot.currently_playing = None
+        await bot.change_presence(activity=None)
+        return True
+    return False
+
+async def play_next(ctx):
+    channel = ctx.channel if hasattr(ctx, 'channel') else ctx
+    guild = channel.guild
+
+    if await clear_queue_if_disconnected(guild):
+        await safe_send(channel, "I was disconnected from the voice channel. The queue has been cleared.")
+        return
+
     if bot.queue.empty():
         bot.currently_playing = None
-        await interaction.channel.send("The queue is empty. Use /play to add more songs!")
+        await safe_send(channel, "The queue is empty. Use /play to add more songs!")
         await bot.change_presence(activity=None)  
         return
+
+    if not is_bot_connected(guild):
+        if bot.last_voice_channel and bot.last_voice_channel.guild == guild:
+            try:
+                await bot.last_voice_channel.connect()
+                await safe_send(channel, f"Reconnected to {bot.last_voice_channel.name}")
+            except Exception as e:
+                await safe_send(channel, f"Failed to reconnect to the voice channel: {e}")
+                return
+        else:
+            await safe_send(channel, "I'm not connected to a voice channel. Use the /join command to connect me.")
+            return
 
     current_url, current_title = await bot.queue.get()
 
     try:
+        if not is_bot_connected(guild):
+            await safe_send(channel, "I'm not connected to a voice channel. Use the /join command to connect me.")
+            return
+
         # Check if audio is already playing and stop it
-        if interaction.guild.voice_client and interaction.guild.voice_client.is_playing():
-            interaction.guild.voice_client.stop()
+        if guild.voice_client and guild.voice_client.is_playing():
+            guild.voice_client.stop()
 
         # Check cache first
         if current_url in video_cache and time.time() - video_cache[current_url]['timestamp'] < CACHE_DURATION:
             stream_url = video_cache[current_url]['stream_url']
         else:
-            ydl_opts = {
-                'format': 'bestaudio/best',
-                'nocheckcertificate': True,
-                'no_warnings': True,
-                'quiet': True,
-            }
-
-            with ThreadPoolExecutor() as executor:
-                loop = asyncio.get_event_loop()
-                info = await loop.run_in_executor(executor, lambda: yt_dlp.YoutubeDL(ydl_opts).extract_info(current_url, download=False))
-
-            stream_url = info['url']
+            stream_url = await extract_stream_url(current_url)
             
             # Cache the stream URL
             video_cache[current_url] = {
@@ -422,12 +459,10 @@ async def play_next(interaction):
         volume_source = discord.PCMVolumeTransformer(audio_source, volume=1.0)
         
         def after_playing(error):
-            if error:
-                print(f"Error in playback: {error}")
-            bot.loop.create_task(play_next(interaction))
+            bot.loop.create_task(after_playing_callback(error, guild))
 
-        if interaction.guild.voice_client:
-            interaction.guild.voice_client.play(volume_source, after=after_playing)
+        if guild.voice_client:
+            guild.voice_client.play(volume_source, after=after_playing)
 
             await bot.change_presence(activity=Activity(type=ActivityType.listening, name=current_title))
             
@@ -442,16 +477,68 @@ async def play_next(interaction):
                 embed.add_field(name="Up Next", value=next_title, inline=True)
             
             # Create and send new MusicControls with embedded message
-            controls = MusicControls(current_title, current_url, interaction.user.id)
-            bot.currently_playing = await interaction.channel.send(embed=embed, view=controls)
+            controls = MusicControls(current_title, current_url, guild.me.id)  # Use bot's ID as requester
+            bot.currently_playing = await safe_send(channel, embed=embed, view=controls)
         else:
             raise Exception("Voice client is not connected.")
 
     except Exception as e:
         print(f"An error occurred while playing the song: {e}")
-        await interaction.channel.send(f"An error occurred while playing the song. Skipping to next.")
-        await play_next(interaction)
+        print(f"Error details: {traceback.format_exc()}")
+        await safe_send(channel, f"An error occurred while playing the song. Skipping to next.")
+        if not bot.queue.empty():
+            await play_next(channel)
+        else:
+            await safe_send(channel, "The queue is now empty.")
 
+@bot.event
+async def on_voice_state_update(member, before, after):
+    if member == bot.user and after.channel is None:
+        # Bot was disconnected from a voice channel
+        bot.last_voice_channel = before.channel
+        guild = before.channel.guild
+        await clear_queue_if_disconnected(guild)
+        
+        # Find a suitable text channel to send the disconnection message
+        text_channel = None
+        if bot.currently_playing and hasattr(bot.currently_playing, 'channel'):
+            text_channel = bot.get_channel(bot.currently_playing.channel.id)
+        if text_channel is None and guild.text_channels:
+            text_channel = guild.text_channels[0]  # Use the first text channel in the guild
+        
+        if text_channel:
+            await safe_send(text_channel, "I was disconnected from the voice channel. The queue has been cleared. Use /join to reconnect me.")
+        else:
+            print("No suitable text channel found to send disconnection message")
+
+async def safe_send(channel, content=None, embed=None, view=None):
+    try:
+        return await channel.send(content=content, embed=embed, view=view)
+    except discord.errors.HTTPException as e:
+        print(f"Failed to send message to channel: {e}")
+        return None
+
+
+async def extract_stream_url(current_url):
+    max_retries = 3
+    for attempt in range(max_retries):
+        try:
+            ydl_opts = {
+                'format': 'bestaudio/best',
+                'nocheckcertificate': True,
+                'no_warnings': True,
+                'quiet': True,
+            }
+
+            with ThreadPoolExecutor() as executor:
+                loop = asyncio.get_event_loop()
+                info = await loop.run_in_executor(executor, lambda: yt_dlp.YoutubeDL(ydl_opts).extract_info(current_url, download=False))
+
+            return info['url']
+        except Exception as e:
+            print(f"Error extracting stream URL (attempt {attempt + 1}/{max_retries}): {e}")
+            if attempt == max_retries - 1:
+                raise
 
 @bot.tree.command(name="ak2", description="Search and play a song by title")
 async def search(interaction: discord.Interaction, title: str):
@@ -509,20 +596,45 @@ async def search(interaction: discord.Interaction, title: str):
 async def join(interaction: discord.Interaction):
     if not interaction.user.voice:
         return await interaction.response.send_message("You are not connected to a voice channel.")
+    
+    if interaction.guild.voice_client:
+        await interaction.guild.voice_client.disconnect()
+    
     await interaction.user.voice.channel.connect()
+    bot.last_voice_channel = interaction.user.voice.channel
     await interaction.response.send_message(f"Joined {interaction.user.voice.channel.name}")
 
-async def after_playing_callback(interaction):
-    if bot.current_playlist:
-        # If we're in a playlist, add the next song to the queue
-        next_entry = bot.current_playlist.pop(0)
-        await bot.queue.put((next_entry['url'], next_entry.get('title', 'Unknown title')))
-    
-    if bot.queue.empty() and not bot.current_playlist:
-        bot.currently_playing = None
-        await interaction.channel.send("The queue is empty. Use /play to add more songs!")
-    else:
+    if not bot.queue.empty():
         await play_next(interaction)
+
+async def after_playing_callback(error, guild):
+    if error:
+        print(f"Error in playback: {error}")
+    
+    if await clear_queue_if_disconnected(guild):
+        if bot.currently_playing and hasattr(bot.currently_playing, 'channel'):
+            channel = bot.get_channel(bot.currently_playing.channel.id)
+            await safe_send(channel, "I was disconnected from the voice channel. The queue has been cleared.")
+        return
+
+    if bot.currently_playing and hasattr(bot.currently_playing, 'channel'):
+        channel = bot.get_channel(bot.currently_playing.channel.id)
+        
+        if bot.queue.empty():
+            bot.currently_playing = None
+            await safe_send(channel, "The queue is empty. Use /play to add more songs!")
+            await bot.change_presence(activity=None)
+        else:
+            await play_next(channel)
+    else:
+        print("Warning: bot.currently_playing is None or doesn't have a channel attribute in after_playing_callback")
+        if not bot.queue.empty():
+            # Try to find a suitable channel to send the message
+            if guild.text_channels:
+                channel = guild.text_channels[0]  # Use the first text channel in the guild
+                await play_next(channel)
+            else:
+                print("No suitable text channel found to continue playback")
 
 
 @bot.tree.command(name="mysong", description="View and play your favorite songs")
@@ -659,6 +771,11 @@ async def on_ready():
     for command in bot.tree.get_commands():
         print(f"- /{command.name}")
     print(f"\nInvite URL: https://discord.com/api/oauth2/authorize?client_id={bot.user.id}&permissions=8&scope=bot%20applications.commands")
+    
+    # Set initial status
+    await bot.change_presence(activity=Activity(type=ActivityType.listening, name="nothing"))
+
+bot.run(BOT_TOKEN)
     
     # Set initial status
     await bot.change_presence(activity=Activity(type=ActivityType.listening, name="nothing"))
